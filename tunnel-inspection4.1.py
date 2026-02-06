@@ -1,13 +1,10 @@
 """
-泸州龙透关隧道工程检验批划分系统 V4.1 (完整版)
-基于TB10753-2018铁路隧道工程施工质量验收标准
-功能特性：
-1. 支持多标准切换
-2. 严格执行工序拆解（一序一验：开挖、钢架、网、锚、喷）
-3. 严格执行二衬独立划分（主线12m/匝道9m台车）
-4. 严格执行特定进尺（CD法0.6m/台阶法1.2m）
-
-Author: Matrix Agent
+泸州龙透关隧道工程检验批划分系统 V5.0
+特性：
+1. 项目数据更新：包含ZK, YK, AK, BK四条独立隧道
+2. 默认分段结构：洞口(2m)+进洞(30m)+标准段+出洞(30m)+洞口(2m)
+3. 支持循环进尺自由编辑
+4. 修复Excel导出报错
 """
 
 import streamlit as st
@@ -15,13 +12,12 @@ import pandas as pd
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from enum import Enum
-import json
 import math
 import io
 
 # 设置页面配置
 st.set_page_config(
-    page_title="泸州龙透关隧道检验批系统 V4",
+    page_title="泸州龙透关隧道检验批系统 V5",
     page_icon="🚇",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -30,86 +26,50 @@ st.set_page_config(
 # ==================== 1. 标准与配置定义 ====================
 
 class InspectionStandard(Enum):
-    """验收标准枚举"""
     TB10753_2018 = "TB10753-2018"  # 高铁隧道
     TB10417 = "TB10417"            # 普通铁路
     JTG_F80 = "JTG F80"            # 公路隧道
     CJJ_37 = "CJJ 37"              # 市政隧道
     GB50299 = "GB 50299"           # 地铁隧道
 
-# 标准基本信息
-STANDARD_INFO = {
-    InspectionStandard.TB10753_2018: {
-        "name": "TB10753-2018", "full_name": "铁路隧道工程施工质量验收标准", "industry": "铁路工程-高铁隧道"
-    },
-    InspectionStandard.TB10417: {
-        "name": "TB10417", "full_name": "铁路隧道工程施工质量验收标准", "industry": "铁路工程-普通铁路"
-    },
-    InspectionStandard.JTG_F80: {
-        "name": "JTG F80", "full_name": "公路工程质量检验评定标准", "industry": "公路工程"
-    },
-    InspectionStandard.CJJ_37: {
-        "name": "CJJ 37", "full_name": "城市道路工程施工质量验收规范", "industry": "市政工程"
-    },
-    InspectionStandard.GB50299: {
-        "name": "GB 50299", "full_name": "地下铁道工程施工质量验收标准", "industry": "地铁工程"
-    }
-}
-
 # 各标准的分部工程编码
 SUBPROJECT_CODES_BY_STANDARD = {
     InspectionStandard.TB10753_2018: {"洞口工程": "01", "超前支护": "02", "洞身开挖": "03", "初期支护": "04", "防排水": "07", "二次衬砌": "06"},
     InspectionStandard.JTG_F80: {"洞口工程": "01", "洞身开挖": "02", "初期支护": "03", "防排水": "05", "二次衬砌": "04"},
-    # 默认回退
     "DEFAULT": {"洞口工程": "01", "洞身开挖": "02", "初期支护": "03", "防排水": "04", "二次衬砌": "05"}
 }
 
-# 【关键配置】循环进尺定义 (CD=0.6m, 台阶=1.2m)
-ADVANCE_PER_CYCLE_BY_STANDARD = {
-    InspectionStandard.TB10753_2018: {
-        "洞口": 0.0,
-        "CD法": 0.6,           # 1榀钢架
-        "CRD法": 0.6,
-        "双隔壁法": 0.6,
-        "全断面法": 1.2,
-        "台阶法": 1.2,         # 2榀钢架
-        "环形开挖法": 1.0
-    },
-    # 为简化代码，其他标准暂沿用相同逻辑，实际可扩展
-    InspectionStandard.JTG_F80: {"洞口": 0.0, "CD法": 0.6, "台阶法": 1.2, "全断面法": 1.2},
+# 默认进尺参考 (仅作为新建段落的默认值)
+DEFAULT_ADVANCE_REF = {
+    "洞口": 0.0,
+    "CD法": 0.6,
+    "台阶法": 1.2,
+    "全断面法": 1.2
 }
 
-# 【关键配置】工序拆解 (一序一验：开挖、钢架、网、锚、喷)
-# 注意：此处不再包含“二次衬砌”，二衬由独立逻辑生成
+# 工序拆解配置
 WORK_ITEM_BY_METHOD = {
     "台阶法": [
-        # 上台阶循环
         {"name": "上台阶开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
         {"name": "上台阶钢架安装", "code": "02", "分部": "初期支护", "步骤": 1},
         {"name": "上台阶钢筋网", "code": "03", "分部": "初期支护", "步骤": 1},
         {"name": "上台阶锚杆", "code": "04", "分部": "初期支护", "步骤": 1},
         {"name": "上台阶喷射混凝土", "code": "05", "分部": "初期支护", "步骤": 1},
-        # 下台阶循环
         {"name": "下台阶开挖", "code": "06", "分部": "洞身开挖", "步骤": 2},
         {"name": "下台阶钢架安装", "code": "07", "分部": "初期支护", "步骤": 2},
         {"name": "下台阶钢筋网", "code": "08", "分部": "初期支护", "步骤": 2},
         {"name": "下台阶喷射混凝土", "code": "09", "分部": "初期支护", "步骤": 2},
-        # 仰拱 (按循环生成)
         {"name": "仰拱开挖", "code": "10", "分部": "洞身开挖", "步骤": 3},
         {"name": "仰拱初期支护", "code": "11", "分部": "初期支护", "步骤": 3},
     ],
     "CD法": [
-        # 左上
         {"name": "①部(左上)开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
         {"name": "①部(左上)钢架", "code": "02", "分部": "初期支护", "步骤": 1},
         {"name": "①部(左上)网/锚/喷", "code": "03", "分部": "初期支护", "步骤": 1},
-        # 左下
         {"name": "②部(左下)开挖", "code": "04", "分部": "洞身开挖", "步骤": 2},
         {"name": "②部(左下)钢架", "code": "05", "分部": "初期支护", "步骤": 2},
-        # 右上
         {"name": "③部(右上)开挖", "code": "06", "分部": "洞身开挖", "步骤": 3},
         {"name": "③部(右上)钢架", "code": "07", "分部": "初期支护", "步骤": 3},
-        # 右下
         {"name": "④部(右下)开挖", "code": "08", "分部": "洞身开挖", "步骤": 4},
         {"name": "④部(右下)钢架", "code": "09", "分部": "初期支护", "步骤": 4},
     ],
@@ -126,7 +86,7 @@ WORK_ITEM_BY_METHOD = {
     ]
 }
 
-# 【关键配置】独立二衬工序
+# 独立二衬工序
 LINING_WORK_ITEMS = [
     {"name": "防水层铺设", "code": "01", "分部": "防排水"},
     {"name": "二衬钢筋安装", "code": "02", "分部": "二次衬砌"},
@@ -178,20 +138,10 @@ class Tunnel:
     def direction_sign(self) -> int:
         return 1 if self.excavation_direction == "正向" else -1
     
-    def recalculate_positions(self):
-        """重新计算各段落里程"""
-        direction = self.direction_sign
-        current = self.start_mileage
-        # 仅作为逻辑上的校验，实际Section对象不需要存储绝对里程，绝对里程在生成时计算
-        pass 
-    
     def get_paragraphs_with_positions(self) -> List[dict]:
         """获取带绝对里程的段落列表"""
         direction = self.direction_sign
         result = []
-        current_standard = get_current_standard()
-        advance_table = get_advance_per_cycle(current_standard)
-        
         current = self.start_mileage
         
         for i, section in enumerate(self.sections):
@@ -201,14 +151,9 @@ class Tunnel:
             else:
                 start, end = current, current - section.length
                 current = end
-                
-            # 确定进尺
-            if section.excavation_method == "CD法":
-                advance = 0.6
-            elif section.excavation_method == "台阶法":
-                advance = 1.2
-            else:
-                advance = advance_table.get(section.excavation_method, 1.2)
+            
+            # 直接使用对象中存储的进尺，不强制覆盖
+            advance = section.advance_per_cycle
             
             result.append({
                 "序号": i + 1,
@@ -227,20 +172,21 @@ class Tunnel:
     def apply_changes(self, df: pd.DataFrame):
         """从Editor DataFrame更新对象状态"""
         new_sections = []
-        current_standard = get_current_standard()
-        advance_table = get_advance_per_cycle(current_standard)
         
         for idx, row in df.iterrows():
             method = row["开挖方法"]
             length = row["长度(m)"]
+            user_advance = row["循环进尺(m)"]
             
-            # 【关键】强制修正进尺
-            if method == "台阶法":
-                advance = 1.2
-            elif method == "CD法":
-                advance = 0.6
+            # 优先使用用户输入的值
+            if user_advance >= 0:
+                advance = user_advance
             else:
-                advance = advance_table.get(method, 1.2)
+                # 默认兜底
+                if method == "洞口": advance = 0.0
+                elif method == "CD法": advance = 0.6
+                elif method == "台阶法": advance = 1.2
+                else: advance = 1.2
             
             section = Section(
                 section_id=row["ID"],
@@ -260,8 +206,9 @@ class Tunnel:
         if not self.sections: return True, issues
         
         calc_total = sum(s.length for s in self.sections)
-        if abs(calc_total - self.total_length) > 0.1:
-            issues.append(f"段落总长({calc_total:.1f}) ≠ 隧道设计长({self.total_length:.1f})")
+        # 允许0.005的误差
+        if abs(calc_total - self.total_length) > 0.005:
+            issues.append(f"段落总长({calc_total:.3f}) ≠ 隧道设计长({self.total_length:.3f})")
         return len(issues) == 0, issues
 
 @dataclass
@@ -281,51 +228,34 @@ def get_subproject_codes(standard: InspectionStandard = None) -> Dict[str, str]:
     if standard is None: standard = get_current_standard()
     return SUBPROJECT_CODES_BY_STANDARD.get(standard, SUBPROJECT_CODES_BY_STANDARD["DEFAULT"])
 
-def get_advance_per_cycle(standard: InspectionStandard = None) -> Dict[str, float]:
-    if standard is None: standard = get_current_standard()
-    defaults = ADVANCE_PER_CYCLE_BY_STANDARD.get(InspectionStandard.TB10753_2018)
-    return ADVANCE_PER_CYCLE_BY_STANDARD.get(standard, defaults)
-
 def format_mileage(m_val: float) -> str:
     """格式化里程为 Kxxx+xxx.xxx"""
     km = int(m_val / 1000)
     m = abs(m_val) % 1000
-    sign = "" if m_val >= 0 else "-" # 简单处理负里程
+    sign = "" if m_val >= 0 else "-"
     return f"{sign}K{km}+{m:07.3f}"
 
 # ==================== 4. 核心逻辑：生成检验批 ====================
 
 def generate_inspection_batches(tunnel: Tunnel, section: Section, section_start: float) -> List[dict]:
-    """
-    生成检验批：包含开挖初支（按循环）和 二衬（按台车）
-    """
+    """生成检验批：包含开挖初支（按循环）和 二衬（按台车）"""
     batches = []
     if section.is_simple_portal:
-        return batches # 简化洞口处理
+        return batches
     
     current_standard = get_current_standard()
     tunnel_code = {"ZK": "1", "YK": "2", "AK": "3", "BK": "4"}.get(tunnel.tunnel_id, "1")
     subproject_codes = get_subproject_codes(current_standard)
     
     # -------------------------------------------------
-    # Part 1: 开挖与初期支护 (按设计进尺循环生成)
+    # Part 1: 开挖与初期支护 (读取Section存储的进尺)
     # -------------------------------------------------
-    # 强制进尺逻辑
-    if section.excavation_method == "CD法":
-        advance = 0.6
-    elif section.excavation_method == "台阶法":
-        advance = 1.2
-    else:
-        advance = section.advance_per_cycle
+    advance = section.advance_per_cycle
+    if advance <= 0.001: advance = 1.0 # 防止除零
     
-    if advance <= 0: advance = 1.0
-    
-    # 计算循环数
     cycle_count = math.ceil(section.length / advance)
-    
     work_items = WORK_ITEM_BY_METHOD.get(section.excavation_method, WORK_ITEM_BY_METHOD["台阶法"])
     
-    # 判断开挖方向，计算里程
     direction = tunnel.direction_sign
     curr_m = section_start
     
@@ -342,7 +272,6 @@ def generate_inspection_batches(tunnel: Tunnel, section: Section, section_start:
         
         for item in work_items:
             sp_code = subproject_codes.get(item["分部"], "01")
-            # 编号格式: T1-03-01-C001
             batch_no = f"T{tunnel_code}-{sp_code}-{item['code']}-C{cycle:04d}"
             
             batches.append({
@@ -360,9 +289,8 @@ def generate_inspection_batches(tunnel: Tunnel, section: Section, section_start:
         curr_m = next_m
 
     # -------------------------------------------------
-    # Part 2: 二次衬砌 (独立逻辑，按台车长度生成)
+    # Part 2: 二次衬砌 (按台车长度)
     # -------------------------------------------------
-    # 判定台车长度：A/B匝道9米，主线12米
     if "匝道" in tunnel.name or "AK" in tunnel.tunnel_id or "BK" in tunnel.tunnel_id:
         trolley_len = 9.0
         trolley_type = "9m台车"
@@ -371,7 +299,6 @@ def generate_inspection_batches(tunnel: Tunnel, section: Section, section_start:
         trolley_type = "12m台车"
         
     lining_cycles = math.ceil(section.length / trolley_len)
-    
     l_curr_m = section_start
     
     for i in range(1, lining_cycles + 1):
@@ -387,7 +314,6 @@ def generate_inspection_batches(tunnel: Tunnel, section: Section, section_start:
         
         for item in LINING_WORK_ITEMS:
             sp_code = subproject_codes.get(item["分部"], "04")
-            # 二衬编号使用 EC 前缀
             batch_no = f"T{tunnel_code}-{sp_code}-{item['code']}-EC{i:03d}"
             
             batches.append({
@@ -411,23 +337,28 @@ def generate_inspection_batches(tunnel: Tunnel, section: Section, section_start:
 def create_default_project() -> Project:
     project = Project(project_id="LZG", name="泸州龙透关隧道工程")
     
+    # 按照用户提供的确切数据更新
     configs = [
-        ("ZK", "左线", 245.0, 1408.0),
-        ("YK", "右线", 244.0, 1406.0),
-        ("AK", "A匝道", 87.0, 425.0),
-        ("BK", "B匝道", 164.0, 755.0)
+        ("ZK", "主线左线隧道", 245.102, 1408.000), # 长度 1162.898
+        ("YK", "主线右线隧道", 244.803, 1406.000), # 长度 1161.197
+        ("AK", "A匝道隧道", 87.000, 425.500),      # 长度 338.500
+        ("BK", "B匝道隧道", 164.000, 755.000)      # 长度 591.000
     ]
     
     for tid, name, start, end in configs:
         tunnel = Tunnel(tunnel_id=tid, name=name, start_mileage=start, end_mileage=end, excavation_direction="正向")
         
-        # 默认分段示例
         total_len = abs(end - start)
+        # 定义5段式结构: 进洞口2m + 进洞30m + 标准段 + 出洞30m + 出洞口2m
+        # 剩余给标准段的长度
+        std_len = total_len - 2.0 - 30.0 - 30.0 - 2.0
+        
         tunnel.sections = [
-            Section(f"{tid}-S01", "进口洞口", 20, "洞口", "V级", 0.0, is_portal=True),
-            Section(f"{tid}-S02", "进洞段", 60, "CD法", "V级", 0.6), # 默认0.6
-            Section(f"{tid}-S03", "标准段", total_len - 100, "台阶法", "IV级", 1.2), # 默认1.2
-            Section(f"{tid}-S04", "出洞段", 20, "CD法", "V级", 0.6),
+            Section(f"{tid}-S01", "进口洞口", 2.0, "洞口", "V级", 0.0, is_portal=True),
+            Section(f"{tid}-S02", "进洞段", 30.0, "CD法", "V级", 0.6, is_portal=False),
+            Section(f"{tid}-S03", "标准段", std_len, "台阶法", "IV级", 1.2, is_portal=False),
+            Section(f"{tid}-S04", "出洞段", 30.0, "CD法", "V级", 0.6, is_portal=False),
+            Section(f"{tid}-S05", "出口洞口", 2.0, "洞口", "V级", 0.0, is_portal=True),
         ]
         project.tunnels.append(tunnel)
     return project
@@ -464,31 +395,23 @@ def generate_svg(tunnel: Tunnel, width: int = 900, height: int = 200) -> str:
     
     svg = [f'<svg width="100%" height="{height}" viewBox="0 0 {width} {height}">']
     svg.append('<rect width="100%" height="100%" fill="#fafbfc"/>')
-    svg.append(f'<text x="{width/2}" y="25" text-anchor="middle" font-weight="bold">{tunnel.name} ({tunnel.start_mileage:.0f}~{tunnel.end_mileage:.0f}m)</text>')
+    svg.append(f'<text x="{width/2}" y="25" text-anchor="middle" font-weight="bold">{tunnel.name} ({format_mileage(tunnel.start_mileage)} ~ {format_mileage(tunnel.end_mileage)})</text>')
     
     y = height - 60
     bar_h = 40
     
-    # 绘图逻辑：根据Section长度比例绘制，而非绝对里程坐标，便于展示
     curr_x = padding
-    
     for s in tunnel.sections:
         w = s.length * scale
         c = colors.get(s.excavation_method, "#BDC3C7")
-        
         svg.append(f'<rect x="{curr_x}" y="{y}" width="{w}" height="{bar_h}" fill="{c}" stroke="white"/>')
-        
-        # 标签
-        if w > 40:
+        if w > 30:
             svg.append(f'<text x="{curr_x+w/2}" y="{y+25}" text-anchor="middle" font-size="10" fill="white">{s.name}</text>')
-        
         curr_x += w
     
-    # 底部里程轴
     svg.append(f'<line x1="{padding}" y1="{y+bar_h+10}" x2="{width-padding}" y2="{y+bar_h+10}" stroke="#333"/>')
-    svg.append(f'<text x="{padding}" y="{y+bar_h+25}" text-anchor="middle" font-size="10">{tunnel.start_mileage}</text>')
-    svg.append(f'<text x="{width-padding}" y="{y+bar_h+25}" text-anchor="middle" font-size="10">{tunnel.end_mileage}</text>')
-    
+    svg.append(f'<text x="{padding}" y="{y+bar_h+25}" text-anchor="middle" font-size="10">{format_mileage(tunnel.start_mileage)}</text>')
+    svg.append(f'<text x="{width-padding}" y="{y+bar_h+25}" text-anchor="middle" font-size="10">{format_mileage(tunnel.end_mileage)}</text>')
     svg.append('</svg>')
     return "".join(svg)
 
@@ -500,15 +423,13 @@ def main():
     
     with st.sidebar:
         st.title("🚇 工程配置")
-        st.info("泸州龙透关隧道工程 V4")
+        st.info("泸州龙透关隧道工程 V5.0")
         
-        # 标准选择
         std_names = [s.value for s in InspectionStandard]
         sel_std = st.selectbox("验收标准", std_names, index=0)
         st.session_state.current_standard = InspectionStandard(sel_std)
         
         st.markdown("---")
-        # 隧道选择
         t_ids = [t.tunnel_id for t in st.session_state.project.tunnels]
         t_names = [t.name for t in st.session_state.project.tunnels]
         sel_t_idx = t_ids.index(st.session_state.selected_tunnel) if st.session_state.selected_tunnel in t_ids else 0
@@ -519,34 +440,30 @@ def main():
             st.session_state.selected_tunnel = new_id
             update_edited_df(get_tunnel())
             st.rerun()
-        
+            
+        if st.button("🔄 重置所有配置"):
+            st.session_state.project = create_default_project()
+            update_edited_df(get_tunnel())
+            st.rerun()
+            
         if tunnel:
             st.markdown("### 隧道参数")
-            ns = st.number_input("起点", value=float(tunnel.start_mileage))
-            ne = st.number_input("终点", value=float(tunnel.end_mileage))
-            nd = st.selectbox("方向", ["正向", "反向"], index=0 if tunnel.excavation_direction=="正向" else 1)
+            st.caption(f"全长: {tunnel.total_length:.3f}m")
+            ns = st.number_input("起点", value=float(tunnel.start_mileage), format="%.3f")
+            ne = st.number_input("终点", value=float(tunnel.end_mileage), format="%.3f")
             
-            if ns != tunnel.start_mileage or ne != tunnel.end_mileage or nd != tunnel.excavation_direction:
+            if ns != tunnel.start_mileage or ne != tunnel.end_mileage:
                 tunnel.start_mileage = ns
                 tunnel.end_mileage = ne
-                tunnel.excavation_direction = nd
                 update_edited_df(tunnel)
                 st.rerun()
 
-            st.markdown("---")
-            st.caption("核心规则：")
-            st.caption("✅ CD法进尺 = 0.6m")
-            st.caption("✅ 台阶法进尺 = 1.2m")
-            st.caption("✅ 匝道二衬 = 9m/模")
-            st.caption("✅ 主线二衬 = 12m/模")
-
-    # 主区域
     if not tunnel: return
     
-    st.subheader(f"📐 {tunnel.name} 纵断面概览")
+    st.subheader(f"📐 {tunnel.name} 配置")
     st.markdown(generate_svg(tunnel), unsafe_allow_html=True)
     
-    st.subheader("📝 施工段落配置")
+    st.markdown("### 📝 施工段落 (支持编辑)")
     
     # 编辑器配置
     col_cfg = {
@@ -555,9 +472,15 @@ def main():
         "名称": st.column_config.TextColumn(width="medium"),
         "起点桩号": st.column_config.TextColumn(disabled=True, width="small"),
         "终点桩号": st.column_config.TextColumn(disabled=True, width="small"),
-        "长度(m)": st.column_config.NumberColumn(min_value=1.0, step=1.0, format="%.1f"),
+        "长度(m)": st.column_config.NumberColumn(min_value=0.1, step=1.0, format="%.3f"),
         "开挖方法": st.column_config.SelectboxColumn(options=[e.value for e in ExcavationMethod], required=True),
-        "循环进尺(m)": st.column_config.NumberColumn(disabled=True, help="系统强制：CD=0.6, 台阶=1.2"),
+        "循环进尺(m)": st.column_config.NumberColumn(
+            disabled=False, 
+            min_value=0.1, 
+            step=0.1, 
+            format="%.1f",
+            help="可自由修改，生成检验批时将严格使用此值"
+        ),
         "围岩等级": st.column_config.SelectboxColumn(options=[r.value for r in RockGrade]),
         "检验批": st.column_config.TextColumn(disabled=True, width="small"),
     }
@@ -570,32 +493,27 @@ def main():
         key="editor"
     )
     
-    # 检测并应用修改
     if not edited_df.equals(st.session_state.edited_df):
         tunnel.apply_changes(edited_df)
         update_edited_df(tunnel)
         st.rerun()
         
-    # 验证
     ok, issues = tunnel.validate()
     if not ok:
         for iss in issues: st.error(iss)
     else:
-        st.success("段落配置逻辑校验通过")
+        st.caption("✅ 长度校验通过")
         
     st.markdown("---")
-    st.subheader("📊 检验批生成")
     
     col1, col2 = st.columns([1, 2])
     with col1:
-        st.write("点击下方按钮生成完整的检验批台账（含开挖、初支细项及二衬）")
+        st.write("#### 检验批生成")
+        st.write("包含：开挖/初期支护(按循环) + 二衬(按台车)")
         gen_btn = st.button("🚀 生成检验批台账", type="primary")
         
     if gen_btn:
         all_batches = []
-        paragraphs = tunnel.get_paragraphs_with_positions()
-        
-        # 计算绝对起点用于生成
         curr_abs = tunnel.start_mileage
         direction = tunnel.direction_sign
         
@@ -611,37 +529,26 @@ def main():
         if all_batches:
             df_res = pd.DataFrame(all_batches)
             st.success(f"生成成功！共 {len(df_res)} 条记录")
-            
-            # 预览
             st.dataframe(df_res.head(50), use_container_width=True)
             
-            # Excel 导出
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 df_res.to_excel(writer, index=False, sheet_name='检验批台账')
                 workbook = writer.book
                 worksheet = writer.sheets['检验批台账']
-                
-                # 样式
                 header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
-                cell_fmt = workbook.add_format({'border': 1, 'align': 'center', 'valign': 'vcenter'})
-                
-                # 设置表头
                 for col_num, value in enumerate(df_res.columns.values):
                     worksheet.write(0, col_num, value, header_fmt)
-                    worksheet.set_column(col_num, col_num, 18) # 默认列宽
-                
-                # 简单设置数据列样式 (xlsxwriter需要行级写入才能完美应用样式到每个单元格，此处简化)
-                worksheet.set_column(0, len(df_res.columns)-1, 15)
+                    worksheet.set_column(col_num, col_num, 18)
                 
             st.download_button(
                 label="📥 下载 Excel 台账",
                 data=output.getvalue(),
-                file_name=f"{tunnel.name}_检验批台账.xlsx",
+                file_name=f"{tunnel.name}_检验批.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.warning("无有效数据生成")
+            st.warning("没有生成有效数据")
 
 if __name__ == "__main__":
     main()
