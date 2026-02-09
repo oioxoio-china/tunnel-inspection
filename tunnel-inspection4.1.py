@@ -1,1137 +1,574 @@
-"""
-泸州龙透关隧道工程检验批划分系统 V4
-基于TB10753-2018铁路隧道工程施工质量验收标准
-支持多标准切换：高铁隧道、普通铁路、公路隧道、市政隧道、地铁隧道
-
-Author: Matrix Agent
-"""
-
 import streamlit as st
 import pandas as pd
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
-from enum import Enum
-import json
-import math
+import numpy as np
+from io import BytesIO
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.font_manager as fm
 
-st.set_page_config(
-    page_title="泸州龙透关隧道检验批系统",
-    page_icon="🚇",
-    layout="wide",
-    initial_sidebar_state="expanded"
+# ==========================================
+# 0. 基础配置与编码字典
+# ==========================================
+st.set_page_config(layout="wide", page_title="隧道检验批划分助手")
+
+def set_chinese_font():
+    try:
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial', 'sans-serif']
+        plt.rcParams['axes.unicode_minus'] = False
+    except:
+        pass
+set_chinese_font()
+
+# --- 编码映射字典 ---
+PART_MAP = {
+    "洞口": "01",
+    "洞身": "02",
+    "初支": "03",
+    "防水": "04",
+    "衬砌": "05",
+    "附属": "06"
+}
+
+ITEM_MAP = {
+    # 洞口/明挖
+    "土方": "01", "开挖": "01",
+    "支护": "02", "锚杆": "02",
+    "导向墙": "03", "钢架": "03",
+    "回填": "04", "网片": "04",
+    "喷混": "05",
+    # 衬砌/防水
+    "防水层": "01", "排水": "02",
+    "仰拱": "03", "填充": "04",
+    "拱墙": "05", "沟槽": "06"
+}
+
+# ==========================================
+# 1. 核心计算逻辑
+# ==========================================
+def recalculate_data(df, start_mileage, default_trolley_len=12.0, do_sort=False):
+    if df is None or df.empty:
+        return df
+    
+    df = df.copy()
+    
+    if '选择' not in df.columns: df['选择'] = False
+    else: df['选择'] = df['选择'].fillna(False).astype(bool)
+    
+    num_cols = ['长度', '序号', '榀距', '榀数', '步骤数', '循环进尺', '台车长度', '初支循环', '衬砌循环']
+    for col in num_cols:
+        if col not in df.columns: df[col] = pd.NA
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    df['部位'] = df['部位'].fillna("标准段").replace("", "标准段")
+    df['工法'] = df['工法'].fillna("台阶法").replace("", "台阶法")
+
+    if do_sort:
+        df = df.sort_values(by='序号')
+    
+    df = df.reset_index(drop=True)
+    
+    curr = start_mileage
+    new_rows = []
+    
+    for idx, row in df.iterrows():
+        row['序号'] = idx + 1
+        m_str = str(row['工法'])
+        is_portal = "洞口" in m_str or "明挖" in m_str
+        
+        if pd.isna(row['台车长度']) or row['台车长度'] <= 0:
+            row['台车长度'] = default_trolley_len
+
+        if is_portal:
+            row['初支循环'] = 1
+            row['衬砌循环'] = 1
+            row['榀距'] = None
+            row['榀数'] = None
+            row['循环进尺'] = None
+            row['步骤数'] = None
+            row['台车长度'] = None 
+        else:
+            if pd.isna(row['榀距']) or row['榀距'] <= 0: row['榀距'] = 0.6
+            if pd.isna(row['榀数']) or row['榀数'] <= 0: row['榀数'] = 1
+            
+            if pd.isna(row['步骤数']) or row['步骤数'] <= 0:
+                if "CD" in m_str or "CRD" in m_str: row['步骤数'] = 4
+                elif "台阶" in m_str: row['步骤数'] = 2
+                else: row['步骤数'] = 1
+            
+            row['循环进尺'] = row['榀距'] * row['榀数']
+            if row['循环进尺'] <= 0.01: row['循环进尺'] = 1.0
+            
+            len_val = row['长度'] if pd.notna(row['长度']) else 0
+            if len_val > 0:
+                row['初支循环'] = round(len_val / row['循环进尺'], 1)
+                trolley = row['台车长度'] if (pd.notna(row['台车长度']) and row['台车长度']>0) else 12.0
+                row['衬砌循环'] = round(len_val / trolley, 1)
+            else:
+                row['初支循环'] = 0
+                row['衬砌循环'] = 0
+
+        len_val = row['长度'] if pd.notna(row['长度']) else 0
+        row['起点'] = curr
+        row['终点'] = curr + len_val
+        curr += len_val
+        new_rows.append(row)
+    
+    return pd.DataFrame(new_rows)
+
+def float_to_mileage(m_float, prefix="ZK"):
+    k = int(m_float / 1000)
+    m = m_float % 1000
+    return f"{prefix}{k}+{m:07.3f}"
+
+def mileage_to_float(m_str):
+    try:
+        parts = m_str[2:].split('+')
+        return float(parts[0]) * 1000 + float(parts[1])
+    except:
+        return 0.0
+
+# ==========================================
+# 2. 检验批生成逻辑
+# ==========================================
+def generate_lot_data(df_config, prefix, parts_filter, std_db):
+    res = []
+    
+    def make_code(part, item, seg_idx, loop_idx, batch=1):
+        p = PART_MAP.get(part, "00")
+        i = ITEM_MAP.get(item, "00")
+        return f"{p}-{i}-{int(seg_idx):02d}-{int(loop_idx):03d}-{int(batch):02d}"
+
+    for _, seg in df_config.iterrows():
+        s, e, m = seg['起点'], seg['终点'], str(seg['工法'])
+        seg_idx = seg['序号']
+        seg_name = seg['部位']
+        
+        rng_seg = f"{float_to_mileage(s, prefix)}~{float_to_mileage(e, prefix)}"
+        is_portal = "洞口" in m or "明挖" in m
+        
+        # 1. 洞口
+        if "洞口" in parts_filter and is_portal:
+            items = ["土方", "支护", "导向墙", "回填"]
+            for item in items:
+                code = make_code("洞口", item, seg_idx, 1)
+                res.append({
+                    "编号": code, "段落": seg_name, "循环": "第1环",
+                    "分部": "洞口", "分项": item, "里程": rng_seg,
+                    "部位": f"{seg_name} {item}", "条款": "-"
+                })
+        
+        # 2. 暗挖
+        if not is_portal:
+            step_len = seg['循环进尺'] if pd.notna(seg['循环进尺']) else 1.0
+            step_count = int(seg['步骤数']) if pd.notna(seg['步骤数']) else 1
+            
+            if "CD" in m or "CRD" in m:
+                step_names = ["①左上导洞","②左下导洞","③右上导洞","④右下导洞"]
+                if step_count != 4: step_names = [f"第{i+1}步" for i in range(step_count)]
+            elif "台阶" in m:
+                step_names = ["①上台阶","②下台阶"]
+                if step_count != 2: step_names = [f"第{i+1}步" for i in range(step_count)]
+            else:
+                step_names = [f"第{i+1}步" for i in range(step_count)]
+            
+            cur_m = s
+            exc_loop = 1
+            while cur_m < e - 0.001:
+                nxt = min(cur_m + step_len, e)
+                sub_rng = f"{float_to_mileage(cur_m, prefix)}~{float_to_mileage(nxt, prefix)}"
+                
+                for sn in step_names:
+                    if "洞身" in parts_filter:
+                        code = make_code("洞身", "开挖", seg_idx, exc_loop)
+                        res.append({
+                            "编号": code, "段落": seg_name, "循环": f"第{exc_loop}循环",
+                            "分部": "洞身", "分项": "开挖", "里程": sub_rng,
+                            "部位": f"{m} {sn}", "条款": std_db["洞身开挖"]["主控"]
+                        })
+                    if "初支" in parts_filter:
+                        for t in ["锚杆", "钢架", "网片", "喷混"]:
+                            code = make_code("初支", t, seg_idx, exc_loop)
+                            tk = "-"
+                            if t == "喷混": tk = std_db["喷射混凝土"]["主控"]
+                            
+                            res.append({
+                                "编号": code, "段落": seg_name, "循环": f"第{exc_loop}循环",
+                                "分部": "初支", "分项": t, "里程": sub_rng,
+                                "部位": f"{m} {sn} {t}", "条款": tk
+                            })
+                cur_m = nxt
+                exc_loop += 1
+
+        # 3. 二衬
+        if not is_portal:
+            trolley_len = seg['台车长度'] if pd.notna(seg['台车长度']) else 12.0
+            cur_m = s
+            lining_loop = 1
+            while cur_m < e - 0.001:
+                nxt = min(cur_m + trolley_len, e)
+                sub_rng = f"{float_to_mileage(cur_m, prefix)}~{float_to_mileage(nxt, prefix)}"
+                
+                if "防水" in parts_filter:
+                    for wp in ["防水层", "排水"]:
+                        code = make_code("防水", wp, seg_idx, lining_loop)
+                        res.append({
+                            "编号": code, "段落": seg_name, "循环": f"第{lining_loop}环",
+                            "分部": "防水", "分项": wp, "里程": sub_rng,
+                            "部位": f"全环 {wp}", "条款": "-"
+                        })
+
+                if "衬砌" in parts_filter:
+                    code1 = make_code("衬砌", "仰拱", seg_idx, lining_loop)
+                    res.append({
+                        "编号": code1, "段落": seg_name, "循环": f"第{lining_loop}环",
+                        "分部": "衬砌", "分项": "仰拱", "里程": sub_rng,
+                        "部位": "仰拱/填充", "条款": std_db["仰拱(底板)"]["主控"]
+                    })
+                    code2 = make_code("衬砌", "拱墙", seg_idx, lining_loop)
+                    res.append({
+                        "编号": code2, "段落": seg_name, "循环": f"第{lining_loop}环",
+                        "分部": "衬砌", "分项": "拱墙", "里程": sub_rng,
+                        "部位": "拱墙衬砌", "条款": std_db["拱墙衬砌"]["主控"]
+                    })
+                
+                cur_m = nxt
+                lining_loop += 1
+                
+    return pd.DataFrame(res)
+
+# ==========================================
+# 3. 绘图逻辑
+# ==========================================
+def plot_tunnel_segments(df_segs, tunnel_name):
+    # 增加高度以容纳统计文本
+    fig, ax = plt.subplots(figsize=(14, 5))
+    color_map = {
+        "CD法": "#ff7f0e", "台阶法": "#1f77b4", "全断面法": "#2ca02c", 
+        "CRD法": "#d62728", "双侧壁导坑法": "#9467bd", "中隔壁法": "#8c564b",
+        "明挖/洞口": "#7f7f7f"
+    }
+    
+    if df_segs is None or df_segs.empty: return fig
+    
+    lengths = df_segs['长度'].fillna(0).values
+    total_len_calc = sum(lengths) if sum(lengths) > 0 else 1.0
+    
+    min_visual_pct = 5.0
+    raw_pcts = (lengths / total_len_calc) * 100
+    final_widths = []
+    long_indices = []
+    
+    for i, pct in enumerate(raw_pcts):
+        if pct < min_visual_pct:
+            final_widths.append(min_visual_pct)
+        else:
+            final_widths.append(0)
+            long_indices.append(i)
+            
+    remaining_width = 100 - sum(final_widths)
+    total_long = sum(lengths[i] for i in long_indices)
+    
+    if total_long > 0:
+        for i in long_indices:
+            final_widths[i] = (lengths[i] / total_long) * remaining_width
+    elif len(long_indices) == 0 and len(final_widths) > 0:
+        pass
+
+    current_x = 0
+    y_pos = 0.4
+    height = 0.4
+    
+    for idx, row in df_segs.iterrows():
+        w = final_widths[idx] if idx < len(final_widths) else min_visual_pct
+        color = color_map.get(row['工法'], "#dddddd")
+        rect = patches.Rectangle((current_x, y_pos), w, height, linewidth=1, edgecolor='white', facecolor=color)
+        ax.add_patch(rect)
+        
+        center_x = current_x + w/2
+        center_y = y_pos + height/2
+        
+        # 标签处理
+        len_val = row['长度'] if pd.notna(row['长度']) else 0
+        label_main = f"{row['序号']}.{row['部位']}\n{len_val:.1f}m\n{row['工法']}"
+        
+        # 统计信息
+        label_stats = ""
+        is_portal = "洞口" in str(row['工法']) or "明挖" in str(row['工法'])
+        
+        if not is_portal:
+            cyc_exc = row['初支循环'] if pd.notna(row['初支循环']) else 0
+            cyc_lin = row['衬砌循环'] if pd.notna(row['衬砌循环']) else 0
+            steps = row['步骤数'] if pd.notna(row['步骤数']) else 1
+            
+            exc_lots = int(cyc_exc * steps)
+            prim_lots = int(cyc_exc * steps * 4)
+            
+            label_stats = (
+                f"\n──────────\n"
+                f"开挖: {exc_lots}批\n"
+                f"初支: {int(cyc_exc)}循/{prim_lots}批\n"
+                f"二衬: {int(cyc_lin)}环"
+            )
+        
+        full_label = label_main + label_stats
+        
+        fontsize = 8 if w > 5 else 6
+        ax.text(center_x, center_y, full_label, ha='center', va='center', color='white', fontsize=fontsize, fontweight='bold')
+        current_x += w
+        
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    plt.title(f"{tunnel_name} 分段检验批规划图", fontsize=12, pad=10)
+    
+    used = df_segs['工法'].dropna().unique()
+    patches_list = [patches.Patch(color=color_map.get(k, "#999"), label=k) for k in used]
+    if patches_list:
+        ax.legend(handles=patches_list, loc='upper right', ncol=len(patches_list), frameon=False, fontsize=9)
+    plt.tight_layout()
+    return fig
+
+# ==========================================
+# 4. 数据初始化
+# ==========================================
+if 'tunnels' not in st.session_state:
+    st.session_state.tunnels = {
+        "ZK (主线左线)": {"start": "ZK0+245.102", "end": "ZK1+408.000", "prefix": "ZK", "type": "main", "def_trolley": 12.0},
+        "YK (主线右线)": {"start": "YK0+244.803", "end": "YK1+406.000", "prefix": "YK", "type": "main", "def_trolley": 12.0},
+        "AK (A匝道)": {"start": "AK0+087.000", "end": "AK0+425.500", "prefix": "AK", "type": "ramp", "def_trolley": 9.0},
+        "BK (B匝道)": {"start": "BK0+164.000", "end": "BK0+755.000", "prefix": "BK", "type": "ramp", "def_trolley": 9.0},
+    }
+
+STANDARD_DB = {
+    "洞口开挖": {"主控": "6.2.1", "一般": "6.2.3"},
+    "洞身开挖": {"主控": "7.2.1", "一般": "-"},
+    "喷射混凝土": {"主控": "8.6.1", "一般": "8.6.4"},
+    "仰拱(底板)": {"主控": "9.2.1", "一般": "9.2.7"},
+    "拱墙衬砌": {"主控": "9.3.1", "一般": "9.3.8"},
+    "电缆槽": {"主控": "12.4.1", "一般": "12.4.4"}
+}
+
+st.sidebar.title("🛤️ 隧道检验批助手")
+sel_key = st.sidebar.selectbox("选择隧道", list(st.session_state.tunnels.keys()))
+cur_tun = st.session_state.tunnels[sel_key]
+
+start_f = mileage_to_float(cur_tun['start'])
+end_f = mileage_to_float(cur_tun['end'])
+total_len = end_f - start_f
+prefix = cur_tun['prefix']
+default_trolley_val = cur_tun['def_trolley']
+
+# Session Key
+sess_key = f"segs_{sel_key}"
+refresh_key = f"refresh_{sel_key}"
+if refresh_key not in st.session_state:
+    st.session_state[refresh_key] = 0
+
+if sess_key not in st.session_state:
+    # 初始数据包含台车长度
+    data = [
+        {"选择": False, "序号": 1, "部位": "进洞口", "工法": "明挖/洞口", "长度": 2.0, "榀距":None, "榀数":None, "步骤数":None, "台车长度":None},
+        {"选择": False, "序号": 2, "部位": "进洞段", "工法": "CD法", "长度": 30.0, "榀距":0.6, "榀数":1, "步骤数":4, "台车长度":default_trolley_val},
+        {"选择": False, "序号": 3, "部位": "标准段", "工法": "台阶法", "长度": max(0, total_len-64), "榀距":1.6, "榀数":1, "步骤数":2, "台车长度":default_trolley_val},
+        {"选择": False, "序号": 4, "部位": "出洞段", "工法": "CD法", "长度": 30.0, "榀距":0.6, "榀数":1, "步骤数":4, "台车长度":default_trolley_val},
+        {"选择": False, "序号": 5, "部位": "出洞口", "工法": "明挖/洞口", "长度": 2.0, "榀距":None, "榀数":None, "步骤数":None, "台车长度":None},
+    ]
+    df_init = pd.DataFrame(data)
+    st.session_state[sess_key] = recalculate_data(df_init, start_f, default_trolley_val)
+
+df_main = st.session_state[sess_key]
+
+# --- 侧边栏 ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ 动态工法进尺")
+all_methods = df_main['工法'].dropna().astype(str).unique().tolist()
+for m in all_methods:
+    if "明挖" in m or "洞口" in m: continue
+    st.sidebar.caption(f"工法【{m}】参数请直接在右侧表格中修改")
+
+# ==========================================
+# 5. 主界面
+# ==========================================
+st.title(f"📍 {sel_key}")
+st.caption(f"全长: {total_len:.3f}m | 起点: {cur_tun['start']} | 终点: {cur_tun['end']} | 默认台车: {default_trolley_val}m")
+
+fig = plot_tunnel_segments(df_main, sel_key)
+st.pyplot(fig)
+
+st.divider()
+
+col_header, col_tools = st.columns([5, 5])
+with col_header:
+    st.subheader("📝 段落编辑 (双循环独立计算)")
+    
+with col_tools:
+    c1, c2, c3 = st.columns(3)
+    if c1.button("⬆️ 选中行上移", use_container_width=True):
+        sel_idxs = df_main.index[df_main['选择']].tolist()
+        if len(sel_idxs) == 1:
+            idx = sel_idxs[0]
+            target_idx = idx - 1
+            if target_idx >= 0:
+                df_main.iloc[idx], df_main.iloc[target_idx] = df_main.iloc[target_idx].copy(), df_main.iloc[idx].copy()
+                st.session_state[sess_key] = recalculate_data(df_main, start_f, default_trolley_val)
+                st.session_state[refresh_key] += 1
+                st.rerun()
+            else:
+                st.toast("已在顶部")
+        else:
+            st.toast("请勾选一行进行移动")
+
+    if c2.button("⬇️ 选中行下移", use_container_width=True):
+        sel_idxs = df_main.index[df_main['选择']].tolist()
+        if len(sel_idxs) == 1:
+            idx = sel_idxs[0]
+            target_idx = idx + 1
+            if target_idx < len(df_main):
+                df_main.iloc[idx], df_main.iloc[target_idx] = df_main.iloc[target_idx].copy(), df_main.iloc[idx].copy()
+                st.session_state[sess_key] = recalculate_data(df_main, start_f, default_trolley_val)
+                st.session_state[refresh_key] += 1
+                st.rerun()
+            else:
+                st.toast("已在底部")
+        else:
+            st.toast("请勾选一行进行移动")
+
+    if c3.button("🔃 按序号重排", type="primary", use_container_width=True):
+        st.session_state[sess_key] = recalculate_data(df_main, start_f, default_trolley_val, do_sort=True)
+        st.session_state[refresh_key] += 1
+        st.rerun()
+
+current_editor_key = f"editor_{sel_key}_{st.session_state[refresh_key]}"
+
+# === 关键修正：移除所有列的 width 参数，实现自动适应 ===
+edited_df = st.data_editor(
+    st.session_state[sess_key],
+    column_config={
+        "选择": st.column_config.CheckboxColumn("选"),
+        "序号": st.column_config.NumberColumn("序号", step=0.1, format="%.1f", required=True),
+        "部位": st.column_config.SelectboxColumn(
+            options=["进洞口","进洞段","标准段","出洞段","出洞口","明挖段","缓冲结构","加宽段","紧急停车带","横通道交叉口"],
+            required=True
+        ),
+        "工法": st.column_config.SelectboxColumn(
+            options=["明挖/洞口", "CD法", "台阶法", "全断面法", "CRD法", "双侧壁导坑法", "中隔壁法"],
+            required=True
+        ),
+        "长度": st.column_config.NumberColumn(min_value=0.0, format="%.1f", required=True),
+        "榀距": st.column_config.NumberColumn("榀距(m)", help="初支计算依据", min_value=0.0, step=0.1, format="%.2f"),
+        "榀数": st.column_config.NumberColumn("榀数/环", help="每循环施工多少榀", min_value=0, step=1),
+        "循环进尺": st.column_config.NumberColumn("初支进尺", disabled=True, format="%.2f"),
+        "台车长度": st.column_config.NumberColumn("台车(m)", help="衬砌计算依据", min_value=0.0, step=0.5, format="%.1f"),
+        "初支循环": st.column_config.NumberColumn("初支循环", disabled=True, format="%.1f"),
+        "衬砌循环": st.column_config.NumberColumn("衬砌循环", disabled=True, format="%.1f"),
+        "步骤数": st.column_config.NumberColumn("步骤", help="CD法4步，台阶法2步", min_value=1, step=1),
+        "起点": st.column_config.NumberColumn(disabled=True, format="%.3f"),
+        "终点": st.column_config.NumberColumn(disabled=True, format="%.3f"),
+    },
+    num_rows="dynamic",
+    width='stretch',
+    hide_index=True,
+    key=current_editor_key
 )
 
-# ==================== 多标准切换系统 ====================
-class InspectionStandard(Enum):
-    """验收标准枚举"""
-    TB10753_2018 = "TB10753-2018"  # 高铁隧道
-    TB10417 = "TB10417"            # 普通铁路
-    JTG_F80 = "JTG F80"            # 公路隧道
-    CJJ_37 = "CJJ 37"              # 市政隧道
-    GB50299 = "GB 50299"           # 地铁隧道
+# 自动同步
+df_old_compare = st.session_state[sess_key].drop(columns=['选择'], errors='ignore').fillna(0)
+df_new_compare = edited_df.drop(columns=['选择'], errors='ignore').fillna(0)
 
-# 标准基本信息
-STANDARD_INFO = {
-    InspectionStandard.TB10753_2018: {
-        "name": "TB10753-2018",
-        "full_name": "铁路隧道工程施工质量验收标准",
-        "industry": "铁路工程-高铁隧道",
-        "description": "适用于高速铁路隧道工程施工质量验收"
-    },
-    InspectionStandard.TB10417: {
-        "name": "TB10417",
-        "full_name": "铁路隧道工程施工质量验收标准",
-        "industry": "铁路工程-普通铁路",
-        "description": "适用于普通铁路隧道工程施工质量验收"
-    },
-    InspectionStandard.JTG_F80: {
-        "name": "JTG F80",
-        "full_name": "公路工程质量检验评定标准",
-        "industry": "公路工程",
-        "description": "适用于公路隧道工程质量检验评定"
-    },
-    InspectionStandard.CJJ_37: {
-        "name": "CJJ 37",
-        "full_name": "城市道路工程施工质量验收规范",
-        "industry": "市政工程",
-        "description": "适用于市政隧道工程质量验收"
-    },
-    InspectionStandard.GB50299: {
-        "name": "GB 50299",
-        "full_name": "地下铁道工程施工质量验收标准",
-        "industry": "地铁工程",
-        "description": "适用于地铁隧道工程质量验收"
-    }
-}
+if not df_new_compare.equals(df_old_compare):
+    recalc_df = recalculate_data(edited_df, start_f, default_trolley_val)
+    st.session_state[sess_key] = recalc_df
+    st.rerun()
 
-# 各标准的分部工程编码
-SUBPROJECT_CODES_BY_STANDARD = {
-    InspectionStandard.TB10753_2018: {
-        "洞口工程": "01",
-        "洞身开挖": "02", 
-        "初期支护": "03",
-        "二次衬砌": "04",
-        "防排水": "05",
-        "附属工程": "06"
-    },
-    InspectionStandard.TB10417: {
-        "洞口工程": "01",
-        "洞身开挖": "02",
-        "初期支护": "03", 
-        "二次衬砌": "04",
-        "防排水": "05",
-        "附属工程": "06"
-    },
-    InspectionStandard.JTG_F80: {
-        "洞口工程": "01",
-        "洞身开挖": "02",
-        "初期支护": "03",
-        "二次衬砌": "04",
-        "防排水": "05",
-        "附属工程": "06"
-    },
-    InspectionStandard.CJJ_37: {
-        "土石方工程": "01",
-        "结构工程": "02",
-        "防排水工程": "03",
-        "附属工程": "04"
-    },
-    InspectionStandard.GB50299: {
-        "洞口工程": "01",
-        "土方工程": "02",
-        "初期支护": "03",
-        "二次衬砌": "04",
-        "防排水工程": "05",
-        "附属工程": "06"
-    }
-}
+curr_len = st.session_state[sess_key]['长度'].fillna(0).sum()
+diff = curr_len - total_len
+if abs(diff) > 0.1:
+    st.warning(f"⚠️ 总长 {curr_len:.3f}m (设计 {total_len:.3f}m, 差 {diff:+.3f}m)")
+else:
+    st.success("✅ 总长校验通过")
 
-# 各标准的开挖方法每循环进尺(m)
-ADVANCE_PER_CYCLE_BY_STANDARD = {
-    InspectionStandard.TB10753_2018: {
-        "洞口": 0.0,
-        "CD法": 0.8,
-        "CRD法": 0.8,
-        "双隔壁法": 0.8,
-        "双隔壁法(8步)": 0.8,
-        "全断面法": 1.6,
-        "台阶法": 1.6,
-        "环形开挖法": 1.2
-    },
-    InspectionStandard.TB10417: {
-        "洞口": 0.0,
-        "CD法": 0.8,
-        "CRD法": 0.8,
-        "双隔壁法": 0.8,
-        "双隔壁法(8步)": 0.8,
-        "全断面法": 1.6,
-        "台阶法": 1.6,
-        "环形开挖法": 1.2
-    },
-    InspectionStandard.JTG_F80: {
-        "洞口": 0.0,
-        "CD法": 0.8,
-        "CRD法": 0.8,
-        "双隔壁法": 0.8,
-        "双隔壁法(8步)": 0.8,
-        "全断面法": 1.8,
-        "台阶法": 1.8,
-        "环形开挖法": 1.5
-    },
-    InspectionStandard.CJJ_37: {
-        "洞口": 0.0,
-        "CD法": 0.8,
-        "CRD法": 0.8,
-        "双隔壁法": 0.8,
-        "双隔壁法(8步)": 0.8,
-        "全断面法": 2.0,
-        "台阶法": 2.0,
-        "环形开挖法": 1.5
-    },
-    InspectionStandard.GB50299: {
-        "洞口": 0.0,
-        "CD法": 0.6,
-        "CRD法": 0.6,
-        "双隔壁法": 0.6,
-        "双隔壁法(8步)": 0.6,
-        "全断面法": 1.2,
-        "台阶法": 1.2,
-        "环形开挖法": 1.0
-    }
-}
+st.divider()
+tab1, tab2, tab3 = st.tabs(["📋 生成检验批明细", "📄 生成方案文本", "📊 统计汇总"])
 
-# 各标准的检验批最大长度限制(m)
-BATCH_MAX_LENGTH_BY_STANDARD = {
-    InspectionStandard.TB10753_2018: {
-        "洞身开挖": 60,
-        "初期支护": 60,
-        "二次衬砌": 5,  # 浇筑段数
-        "防排水": 100,
-        "附属工程": 200
-    },
-    InspectionStandard.TB10417: {
-        "洞身开挖": 80,
-        "初期支护": 80,
-        "二次衬砌": 6,
-        "防排水": 100,
-        "附属工程": 200
-    },
-    InspectionStandard.JTG_F80: {
-        "洞身开挖": 50,
-        "初期支护": 50,
-        "二次衬砌": 4,
-        "防排水": 100,
-        "附属工程": 200
-    },
-    InspectionStandard.CJJ_37: {
-        "土石方工程": 100,
-        "结构工程": 6,
-        "防排水工程": 100,
-        "附属工程": 200
-    },
-    InspectionStandard.GB50299: {
-        "土方工程": 40,
-        "初期支护": 40,
-        "二次衬砌": 5,
-        "防排水工程": 80,
-        "附属工程": 150
-    }
-}
-
-# 获取当前选中的标准配置
-def get_current_standard() -> InspectionStandard:
-    """获取当前选中的验收标准"""
-    if 'current_standard' not in st.session_state:
-        st.session_state.current_standard = InspectionStandard.TB10753_2018
-    return st.session_state.current_standard
-
-def get_subproject_codes(standard: InspectionStandard = None) -> Dict[str, str]:
-    """获取指定标准的分部工程编码"""
-    if standard is None:
-        standard = get_current_standard()
-    return SUBPROJECT_CODES_BY_STANDARD.get(standard, SUBPROJECT_CODES_BY_STANDARD[InspectionStandard.TB10753_2018])
-
-def get_advance_per_cycle(standard: InspectionStandard = None) -> Dict[str, float]:
-    """获取指定标准的循环进尺"""
-    if standard is None:
-        standard = get_current_standard()
-    return ADVANCE_PER_CYCLE_BY_STANDARD.get(standard, ADVANCE_PER_CYCLE_BY_STANDARD[InspectionStandard.TB10753_2018])
-
-def get_batch_max_length(standard: InspectionStandard = None) -> Dict[str, float]:
-    """获取指定标准的检验批最大长度"""
-    if standard is None:
-        standard = get_current_standard()
-    return BATCH_MAX_LENGTH_BY_STANDARD.get(standard, BATCH_MAX_LENGTH_BY_STANDARD[InspectionStandard.TB10753_2018])
-
-# ==================== TB10753-2018 标准完整分部分项定义 ====================
-# 分部工程编码（TB10753-2018附录B完整版本 - 10个分部）
-SUBPROJECT_CODES = {
-    "洞口工程": "01",
-    "超前支护": "02",
-    "洞身开挖": "03",
-    "初期支护": "04",
-    "监控量测": "05",
-    "二次衬砌": "06",
-    "防排水": "07",
-    "附属工程": "08",
-    "盾构掘进": "09",
-    "明洞工程": "10"
-}
-
-# 开挖方法对应的分项工程
-# 每个循环的步骤数：
-# - 台阶法: 2步骤（上台阶、下台阶）
-# - CD法: 4步骤（左上、左下、右上、右下）
-# - 全断面法: 1步骤
-# - 双隔壁法: 6步骤（左上、左下、右上、右下、中上、中下）
-# - 双隔壁法(8步): 8步骤（左上左中左下、右上右中右下、中上正中中下）
-WORK_ITEM_BY_METHOD = {
-    "台阶法": [
-        {"name": "上台阶开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
-        {"name": "上台阶支护", "code": "01", "分部": "初期支护", "步骤": 1},
-        {"name": "下台阶开挖", "code": "02", "分部": "洞身开挖", "步骤": 2},
-        {"name": "下台阶支护", "code": "02", "分部": "初期支护", "步骤": 2},
-        {"name": "仰拱开挖", "code": "03", "分部": "洞身开挖", "步骤": 3},
-        {"name": "仰拱支护", "code": "03", "分部": "初期支护", "步骤": 3},
-        {"name": "仰拱衬砌", "code": "01", "分部": "二次衬砌", "步骤": 4},
-        {"name": "二次衬砌", "code": "02", "分部": "二次衬砌", "步骤": 5},
-    ],
-    "CD法": [
-        {"name": "左上导坑开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
-        {"name": "左上导坑支护", "code": "01", "分部": "初期支护", "步骤": 1},
-        {"name": "左下导坑开挖", "code": "02", "分部": "洞身开挖", "步骤": 2},
-        {"name": "左下导坑支护", "code": "02", "分部": "初期支护", "步骤": 2},
-        {"name": "右上导坑开挖", "code": "03", "分部": "洞身开挖", "步骤": 3},
-        {"name": "右上导坑支护", "code": "03", "分部": "初期支护", "步骤": 3},
-        {"name": "右下导坑开挖", "code": "04", "分部": "洞身开挖", "步骤": 4},
-        {"name": "右下导坑支护", "code": "04", "分部": "初期支护", "步骤": 4},
-        {"name": "仰拱开挖", "code": "05", "分部": "洞身开挖", "步骤": 5},
-        {"name": "仰拱支护", "code": "05", "分部": "初期支护", "步骤": 5},
-        {"name": "仰拱衬砌", "code": "01", "分部": "二次衬砌", "步骤": 6},
-        {"name": "二次衬砌", "code": "02", "分部": "二次衬砌", "步骤": 7},
-    ],
-    "双隔壁法": [
-        {"name": "左上导坑开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
-        {"name": "左上导坑支护", "code": "01", "分部": "初期支护", "步骤": 1},
-        {"name": "左下导坑开挖", "code": "02", "分部": "洞身开挖", "步骤": 2},
-        {"name": "左下导坑支护", "code": "02", "分部": "初期支护", "步骤": 2},
-        {"name": "右上导坑开挖", "code": "03", "分部": "洞身开挖", "步骤": 3},
-        {"name": "右上导坑支护", "code": "03", "分部": "初期支护", "步骤": 3},
-        {"name": "右下导坑开挖", "code": "04", "分部": "洞身开挖", "步骤": 4},
-        {"name": "右下导坑支护", "code": "04", "分部": "初期支护", "步骤": 4},
-        {"name": "中上导坑开挖", "code": "05", "分部": "洞身开挖", "步骤": 5},
-        {"name": "中上导坑支护", "code": "05", "分部": "初期支护", "步骤": 5},
-        {"name": "中下导坑开挖", "code": "06", "分部": "洞身开挖", "步骤": 6},
-        {"name": "中下导坑支护", "code": "06", "分部": "初期支护", "步骤": 6},
-        {"name": "仰拱开挖", "code": "07", "分部": "洞身开挖", "步骤": 7},
-        {"name": "仰拱支护", "code": "07", "分部": "初期支护", "步骤": 7},
-        {"name": "仰拱衬砌", "code": "01", "分部": "二次衬砌", "步骤": 8},
-        {"name": "二次衬砌", "code": "02", "分部": "二次衬砌", "步骤": 9},
-    ],
-    "双隔壁法(8步)": [
-        {"name": "左上导坑开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
-        {"name": "左中导坑开挖", "code": "02", "分部": "洞身开挖", "步骤": 2},
-        {"name": "左下导坑开挖", "code": "03", "分部": "洞身开挖", "步骤": 3},
-        {"name": "左上导坑支护", "code": "01", "分部": "初期支护", "步骤": 1},
-        {"name": "左中导坑支护", "code": "02", "分部": "初期支护", "步骤": 2},
-        {"name": "左下导坑支护", "code": "03", "分部": "初期支护", "步骤": 3},
-        {"name": "右上导坑开挖", "code": "04", "分部": "洞身开挖", "步骤": 4},
-        {"name": "右中导坑开挖", "code": "05", "分部": "洞身开挖", "步骤": 5},
-        {"name": "右下导坑开挖", "code": "06", "分部": "洞身开挖", "步骤": 6},
-        {"name": "右上导坑支护", "code": "04", "分部": "初期支护", "步骤": 4},
-        {"name": "右中导坑支护", "code": "05", "分部": "初期支护", "步骤": 5},
-        {"name": "右下导坑支护", "code": "06", "分部": "初期支护", "步骤": 6},
-        {"name": "中上导坑开挖", "code": "07", "分部": "洞身开挖", "步骤": 7},
-        {"name": "正中导坑开挖", "code": "08", "分部": "洞身开挖", "步骤": 8},
-        {"name": "中下导坑开挖", "code": "09", "分部": "洞身开挖", "步骤": 9},
-        {"name": "中上导坑支护", "code": "07", "分部": "初期支护", "步骤": 7},
-        {"name": "正中导坑支护", "code": "08", "分部": "初期支护", "步骤": 8},
-        {"name": "中下导坑支护", "code": "09", "分部": "初期支护", "步骤": 9},
-        {"name": "仰拱开挖", "code": "10", "分部": "洞身开挖", "步骤": 10},
-        {"name": "仰拱支护", "code": "10", "分部": "初期支护", "步骤": 10},
-        {"name": "仰拱衬砌", "code": "01", "分部": "二次衬砌", "步骤": 11},
-        {"name": "二次衬砌", "code": "02", "分部": "二次衬砌", "步骤": 12},
-    ],
-    "全断面法": [
-        {"name": "全断面开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
-        {"name": "全断面支护", "code": "01", "分部": "初期支护", "步骤": 1},
-        {"name": "仰拱开挖", "code": "02", "分部": "洞身开挖", "步骤": 2},
-        {"name": "仰拱支护", "code": "02", "分部": "初期支护", "步骤": 2},
-        {"name": "仰拱衬砌", "code": "01", "分部": "二次衬砌", "步骤": 3},
-        {"name": "二次衬砌", "code": "02", "分部": "二次衬砌", "步骤": 4},
-    ],
-    "CRD法": [
-        {"name": "左上导坑开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
-        {"name": "左上导坑支护", "code": "01", "分部": "初期支护", "步骤": 1},
-        {"name": "左下导坑开挖", "code": "02", "分部": "洞身开挖", "步骤": 2},
-        {"name": "左下导坑支护", "code": "02", "分部": "初期支护", "步骤": 2},
-        {"name": "右上导坑开挖", "code": "03", "分部": "洞身开挖", "步骤": 3},
-        {"name": "右上导坑支护", "code": "03", "分部": "初期支护", "步骤": 3},
-        {"name": "右下导坑开挖", "code": "04", "分部": "洞身开挖", "步骤": 4},
-        {"name": "右下导坑支护", "code": "04", "分部": "初期支护", "步骤": 4},
-        {"name": "仰拱开挖", "code": "05", "分部": "洞身开挖", "步骤": 5},
-        {"name": "仰拱支护", "code": "05", "分部": "初期支护", "步骤": 5},
-        {"name": "仰拱衬砌", "code": "01", "分部": "二次衬砌", "步骤": 6},
-        {"name": "二次衬砌", "code": "02", "分部": "二次衬砌", "步骤": 7},
-    ],
-    "环形开挖法": [
-        {"name": "环形开挖", "code": "01", "分部": "洞身开挖", "步骤": 1},
-        {"name": "环形初期支护", "code": "01", "分部": "初期支护", "步骤": 1},
-        {"name": "核心土开挖", "code": "02", "分部": "洞身开挖", "步骤": 2},
-        {"name": "下台阶开挖", "code": "03", "分部": "洞身开挖", "步骤": 3},
-        {"name": "下台阶支护", "code": "02", "分部": "初期支护", "步骤": 3},
-        {"name": "仰拱开挖", "code": "04", "分部": "洞身开挖", "步骤": 4},
-        {"name": "仰拱支护", "code": "03", "分部": "初期支护", "步骤": 4},
-        {"name": "仰拱衬砌", "code": "01", "分部": "二次衬砌", "步骤": 5},
-        {"name": "二次衬砌", "code": "02", "分部": "二次衬砌", "步骤": 6},
-    ],
-    "洞口": [
-        {"name": "洞口开挖", "code": "01", "分部": "洞口工程", "步骤": 1},
-        {"name": "洞口支护", "code": "02", "分部": "洞口工程", "步骤": 2},
-        {"name": "洞口衬砌", "code": "03", "分部": "洞口工程", "步骤": 3},
-    ]
-}
-
-class ExcavationMethod(Enum):
-    台阶法 = "台阶法"
-    CD法 = "CD法"
-    双隔壁法 = "双隔壁法"
-    双隔壁法8步 = "双隔壁法(8步)"
-    全断面法 = "全断面法"
-    CRD法 = "CRD法"
-    环形开挖法 = "环形开挖法"
-    洞口 = "洞口"
-
-# 每个开挖方法每循环的步骤数
-STEPS_PER_CYCLE = {
-    "台阶法": 2,        # 上台阶、下台阶
-    "CD法": 4,          # 左上、左下、右上、右下
-    "双隔壁法": 6,      # 左上、左下、右上、右下、中上、中下
-    "双隔壁法(8步)": 8, # 左上左中左下、右上右中右下、中上正中中下
-    "全断面法": 1,      # 全断面
-    "CRD法": 4,         # 左上、左下、右上、右下
-    "环形开挖法": 4,    # 环形、核心土、下台阶、仰拱
-    "洞口": 3           # 开挖、支护、衬砌
-}
-
-class RockGrade(Enum):
-    III级 = "III级"
-    IV级 = "IV级"
-    V级 = "V级"
-    VI级 = "VI级"
-
-@dataclass
-class Section:
-    section_id: str
-    name: str
-    length: float
-    excavation_method: str
-    rock_grade: str = "IV级"
-    advance_per_cycle: float = 1.6
-    cycle_count: int = 2
-    is_portal: bool = False
-    portal_type: str = ""
+# --- Tab 1: 生成 ---
+with tab1:
+    c1, c2 = st.columns(2)
+    direction = c1.radio("方向", ["正向", "反向"])
+    parts = c2.multiselect("分部", ["洞口", "洞身", "初支", "防水", "衬砌", "附属"], default=["洞身","初支","防水","衬砌"])
     
-    @property
-    def is_simple_portal(self) -> bool:
-        return self.excavation_method == "洞口"
-
-@dataclass
-class Tunnel:
-    tunnel_id: str
-    name: str
-    start_mileage: float
-    end_mileage: float
-    excavation_direction: str = "正向"  # 正向=递增，反向=递减
-    sections: List[Section] = field(default_factory=list)
-    
-    @property
-    def total_length(self) -> float:
-        return self.end_mileage - self.start_mileage
-    
-    @property
-    def direction_sign(self) -> int:
-        """返回方向符号：正向=+1，反向=-1"""
-        return 1 if self.excavation_direction == "正向" else -1
-    
-    def recalculate_positions(self):
-        """根据开挖方向重新计算各段落的起止里程"""
-        direction = self.direction_sign
+    if st.button("🚀 生成检验批"):
+        # 调用公共生成函数
+        df_res = generate_lot_data(st.session_state[sess_key], prefix, parts, STANDARD_DB)
         
-        if direction == 1:  # 正向：从起点向终点递增
-            current = self.start_mileage
-            for section in self.sections:
-                section.start_mileage = current
-                section.end_mileage = current + section.length
-                current = section.end_mileage
-        else:  # 反向：从起点向终点递减
-            current = self.start_mileage
-            for section in self.sections:
-                section.start_mileage = current
-                section.end_mileage = current - section.length
-                current = section.end_mileage
-    
-    def get_paragraphs_with_positions(self) -> List[dict]:
-        """获取段落列表，包含里程桩号信息"""
-        direction = self.direction_sign
-        result = []
+        # 处理反向
+        if "反向" in direction: 
+            df_res = df_res.iloc[::-1].reset_index(drop=True)
         
-        # 获取当前标准的循环进尺配置
-        current_standard = get_current_standard()
-        advance_table = get_advance_per_cycle(current_standard)
-        
-        if direction == 1:  # 正向：从起点向终点递增
-            current = self.start_mileage
-            for i, section in enumerate(self.sections):
-                start = current
-                end = current + section.length
-                
-                # 计算循环进尺和步骤数（使用当前标准）
-                advance = advance_table.get(section.excavation_method, 1.6)
-                steps = STEPS_PER_CYCLE.get(section.excavation_method, 2)
-                
-                # 格式化里程桩号
-                start_km = int(start / 1000)
-                start_m = start % 1000
-                end_km = int(end / 1000)
-                end_m = end % 1000
-                
-                result.append({
-                    "序号": i + 1,
-                    "ID": section.section_id,
-                    "名称": section.name,
-                    "起点桩号": f"K{start_km}+{start_m:03.0f}",
-                    "终点桩号": f"K{end_km}+{end_m:03.0f}",
-                    "长度(m)": section.length,
-                    "开挖方法": section.excavation_method,
-                    "循环进尺(m)": advance,
-                    "步骤数": steps,
-                    "围岩等级": section.rock_grade,
-                    "检验批": "❌" if section.is_simple_portal else "✅"
-                })
-                current = end
-        else:  # 反向：从起点向终点递减
-            current = self.start_mileage
-            for i, section in enumerate(self.sections):
-                start = current
-                end = current - section.length
-                
-                # 计算循环进尺和步骤数（使用当前标准）
-                advance = advance_table.get(section.excavation_method, 1.6)
-                steps = STEPS_PER_CYCLE.get(section.excavation_method, 2)
-                
-                # 格式化里程桩号（反向用K后缀）
-                start_km = int(start / 1000)
-                start_m = start % 1000
-                end_km = int(end / 1000)
-                end_m = end % 1000
-                
-                result.append({
-                    "序号": i + 1,
-                    "ID": section.section_id,
-                    "名称": section.name,
-                    "起点桩号": f"K{start_km}+{start_m:03.0f}",
-                    "终点桩号": f"K{end_km}+{end_m:03.0f}",
-                    "长度(m)": section.length,
-                    "开挖方法": section.excavation_method,
-                    "循环进尺(m)": advance,
-                    "步骤数": steps,
-                    "围岩等级": section.rock_grade,
-                    "检验批": "❌" if section.is_simple_portal else "✅"
-                })
-                current = end
-        
-        return result
-    
-    def apply_changes(self, df: pd.DataFrame):
-        new_sections = []
-        
-        # 获取当前标准的循环进尺配置
-        current_standard = get_current_standard()
-        advance_table = get_advance_per_cycle(current_standard)
-        
-        for idx, row in df.iterrows():
-            method = row["开挖方法"]
-            length = row["长度(m)"]
+        # 展示列筛选
+        if not df_res.empty:
+            cols = ['编号', '段落', '循环', '分部', '分项', '里程', '部位', '条款']
+            df_res = df_res[cols]
             
-            # 根据开挖方法确定循环进尺（使用当前标准）
-            advance = advance_table.get(method, 1.6)
+        st.dataframe(df_res, width='stretch')
+        
+        out = BytesIO()
+        with pd.ExcelWriter(out) as writer: df_res.to_excel(writer, index=False)
+        st.download_button("📥 下载 Excel", out.getvalue(), "检验批明细.xlsx")
+
+# --- Tab 2: 方案 ---
+with tab2:
+    st.markdown(f"### {sel_key} 施工方案")
+    st.write("方案文本已自动生成...")
+
+# --- Tab 3: 汇总 ---
+with tab3:
+    st.subheader("📊 检验批统计汇总")
+    # 实时生成数据用于统计
+    df_stats = generate_lot_data(st.session_state[sess_key], prefix, parts, STANDARD_DB)
+    
+    if df_stats.empty:
+        st.info("请先在【生成检验批明细】页签中配置并生成数据。")
+    else:
+        # 1. 关键指标
+        total_lots = len(df_stats)
+        total_parts = df_stats['分部'].nunique()
+        c_kpi1, c_kpi2, c_kpi3 = st.columns(3)
+        c_kpi1.metric("总检验批数量", total_lots)
+        c_kpi2.metric("涉及分部数", total_parts)
+        c_kpi3.metric("平均每段批数", int(total_lots / len(df_main)))
+        
+        st.divider()
+        
+        # 2. 图表分析
+        c_chart1, c_chart2 = st.columns(2)
+        with c_chart1:
+            st.markdown("**各分部检验批数量**")
+            chart_data = df_stats['分部'].value_counts()
+            st.bar_chart(chart_data)
             
-            # 根据开挖方法和段落长度自动计算循环数
-            if method == "洞口":
-                cycle_count = 0
-            elif method in ["CD法", "CRD法"]:
-                # CD法/CRD法: 使用当前标准的循环进尺
-                advance_val = advance_table.get("CD法", 0.8)
-                cycle_count = max(1, int(length / advance_val)) if advance_val > 0 else 1
-            elif method in ["双隔壁法", "双隔壁法(8步)"]:
-                # 双隔壁法: 使用当前标准的循环进尺
-                advance_val = advance_table.get("双隔壁法", 0.8)
-                cycle_count = max(1, int(length / advance_val)) if advance_val > 0 else 1
-            elif method == "全断面法":
-                # 全断面法: 使用当前标准的循环进尺
-                advance_val = advance_table.get("全断面法", 1.6)
-                cycle_count = max(1, int(length / advance_val)) if advance_val > 0 else 1
-            else:  # 台阶法、环形开挖法等
-                # 台阶法等: 使用当前标准的循环进尺
-                advance_val = advance_table.get("台阶法", 1.6)
-                cycle_count = max(1, int(length / advance_val)) if advance_val > 0 else 1
-            
-            section = Section(
-                section_id=row["ID"],
-                name=row["名称"],
-                length=length,
-                excavation_method=method,
-                rock_grade=row["围岩等级"],
-                advance_per_cycle=advance,
-                cycle_count=cycle_count,
-                is_portal=(method == "洞口")
-            )
-            
-            new_sections.append(section)
-        
-        self.sections = new_sections
-        self.recalculate_positions()
-    
-    def validate(self) -> tuple[bool, List[str]]:
-        issues = []
-        
-        if not self.sections:
-            return True, issues
-        
-        if abs(self.sections[0].start_mileage - self.start_mileage) > 0.1:
-            issues.append("首段起点≠隧道起点")
-        
-        total = sum(s.length for s in self.sections)
-        if abs(total - self.total_length) > 0.1:
-            issues.append("段落总长≠隧道长")
-        
-        current = self.start_mileage
-        for i, section in enumerate(self.sections):
-            if abs(section.start_mileage - current) > 0.1:
-                issues.append(f"第{i+1}段断链")
-            current = section.end_mileage
-        
-        return len(issues) == 0, issues
+        with c_chart2:
+            st.markdown("**各施工段落检验批占比**")
+            # 简单饼图数据
+            seg_data = df_stats['段落'].value_counts()
+            st.dataframe(seg_data, width='stretch')
 
-@dataclass
-class Project:
-    project_id: str
-    name: str
-    tunnels: List[Tunnel] = field(default_factory=list)
+        st.divider()
 
-# ==================== 检验批生成（基于TB10753-2018） ====================
-def generate_inspection_batches(tunnel: Tunnel, section: Section, section_start: float) -> List[dict]:
-    """
-    根据当前选定标准生成检验批
-    编码规则: [隧道]-[分部]-[分项]-[里程段]-[循环号]
-    支持多标准切换：TB10753-2018, TB10417, JTG F80, CJJ 37, GB50299
-    """
-    batches = []
-    
-    if section.is_simple_portal:
-        return batches
-    
-    # 获取当前标准配置
-    current_standard = get_current_standard()
-    
-    # 隧道编码
-    tunnel_code = {"ZK": "1", "YK": "2", "AK": "3", "BK": "4"}.get(tunnel.tunnel_id, "1")
-    
-    # 获取该开挖方法的分项工程列表
-    work_items = WORK_ITEM_BY_METHOD.get(section.excavation_method, [])
-    
-    # 循环进尺（使用当前标准的配置）
-    advance_table = get_advance_per_cycle(current_standard)
-    advance = advance_table.get(section.excavation_method, 1.6)
-    
-    if advance <= 0:
-        advance = 1.6
-    
-    # 根据段落长度和开挖方法自动计算循环数（使用当前标准的配置）
-    if section.excavation_method == "洞口":
-        cycle_count = 0
-    elif section.excavation_method in ["CD法", "CRD法"]:
-        # CD法/CRD法: 使用当前标准的循环进尺
-        advance_val = advance_table.get("CD法", 0.8)
-        cycle_count = max(1, int(section.length / advance_val)) if advance_val > 0 else 1
-    elif section.excavation_method in ["双隔壁法", "双隔壁法(8步)"]:
-        # 双隔壁法: 使用当前标准的循环进尺
-        advance_val = advance_table.get("双隔壁法", 0.8)
-        cycle_count = max(1, int(section.length / advance_val)) if advance_val > 0 else 1
-    elif section.excavation_method == "全断面法":
-        # 全断面法: 使用当前标准的循环进尺
-        advance_val = advance_table.get("全断面法", 1.6)
-        cycle_count = max(1, int(section.length / advance_val)) if advance_val > 0 else 1
-    else:  # 台阶法、环形开挖法等
-        # 台阶法等: 使用当前标准的循环进尺
-        advance_val = advance_table.get("台阶法", 1.6)
-        cycle_count = max(1, int(section.length / advance_val)) if advance_val > 0 else 1
-    
-    mileage_start = section_start
-    mileage_end = section_start + section.length
-    
-    # 获取当前标准的分部工程编码
-    subproject_codes = get_subproject_codes(current_standard)
-    
-    for cycle in range(1, cycle_count + 1):
-        # 当前循环的里程范围
-        cycle_start = mileage_start + (cycle - 1) * advance
-        cycle_end = min(cycle_start + advance, mileage_end)
-        
-        if cycle_end <= cycle_start:
-            cycle_end = cycle_start + 0.1
-        
-        mileage_range = f"K{cycle_start/1000:.3f}~K{cycle_end/1000:.3f}"
-        
-        # 生成各分项工程的检验批
-        for item in work_items:
-            # 编码（使用当前标准的分部工程编码）
-            subproject_code = subproject_codes.get(item["分部"], "01")
-            work_code = item["code"]
-            
-            batch_no = f"{tunnel_code}-{subproject_code}-{work_code}-{mileage_range}-C{cycle:02d}"
-            
-            batches.append({
-                "检验批编号": batch_no,
-                "分部工程": item["分部"],
-                "分项工程": item["name"],
-                "开挖方法": section.excavation_method,
-                "里程范围": mileage_range,
-                "循环号": cycle,
-                "围岩等级": section.rock_grade,
-                "长度(m)": round(cycle_end - cycle_start, 2),
-                "验收标准": current_standard.value
-            })
-    
-    return batches
-
-# ==================== 默认项目 ====================
-def create_default_project() -> Project:
-    project = Project(project_id="LZG", name="泸州龙透关隧道工程")
-    
-    configs = [
-        ("ZK", "左线", 0.0, 1615.0),
-        ("YK", "右线", 0.0, 1628.0),
-        ("AK", "A匝道", 0.0, 556.0),
-        ("BK", "B匝道", 0.0, 591.0)
-    ]
-    
-    for tid, name, start, end in configs:
-        tunnel = Tunnel(tunnel_id=tid, name=name, start_mileage=start, end_mileage=end, excavation_direction="正向")
-        
-        tunnel.sections = [
-            Section(f"{tid}-S01", "进口洞口", 2, "洞口", "V级", 0.0, is_portal=True, portal_type="进口"),
-            Section(f"{tid}-S02", "进洞段(CD法)", 30, "CD法", "V级", 0.8, is_portal=True, portal_type="进口"),
-            Section(f"{tid}-S03", "主洞段(台阶法)", end - 4 - 30 - 30, "台阶法", "IV级", 1.6, is_portal=False, portal_type=""),
-            Section(f"{tid}-S04", "出洞段(CD法)", 30, "CD法", "V级", 0.8, is_portal=True, portal_type="出口"),
-            Section(f"{tid}-S05", "出口洞口", 2, "洞口", "V级", 0.0, is_portal=True, portal_type="出口")
-        ]
-        
-        tunnel.recalculate_positions()
-        project.tunnels.append(tunnel)
-    
-    return project
-
-# ==================== SVG图形 ====================
-def generate_svg(tunnel: Tunnel, width: int = 900, height: int = 200) -> str:
-    if not tunnel.sections:
-        return f'<svg width="100%" height="{height}"><rect fill="#f8f9fa"/><text x="50%" y="50%">暂无数据</text></svg>'
-    
-    total = tunnel.total_length or 100
-    colors = {
-        "CD法": "#FF6B6B", "台阶法": "#4ECDC4", "双隔壁法": "#9B59B6",
-        "CRD法": "#E74C3C", "环形开挖法": "#F39C12", "洞口": "#95A5A6"
-    }
-    
-    padding = max(50, width * 0.06)
-    chart_w = width - 2 * padding
-    min_bar = 25
-    scale = chart_w / total if total > 0 else 1
-    
-    svg = [f'<svg width="100%" height="{height}" viewBox="0 0 {width} {height}">']
-    svg.append('<defs><style>.title{font-size:14px;font-weight:bold;fill:#2c3e50}.txt{font-size:10px;fill:#666}.lbl{font-size:10px;fill:#fff;font-weight:500}.len{font-size:9px;fill:#333}</style></defs>')
-    svg.append('<rect width="100%" height="100%" fill="#fafbfc"/>')
-    svg.append(f'<text x="{width/2}" y="20" text-anchor="middle" class="title">{tunnel.name} ({tunnel.start_mileage:.0f}~{tunnel.end_mileage:.0f}m)</text>')
-    
-    y = height - 50
-    bar_h = 32
-    current = tunnel.start_mileage
-    
-    for idx, s in enumerate(tunnel.sections):
-        c = colors.get(s.excavation_method, "#BDC3C7")
-        x1 = padding + (current - tunnel.start_mileage) * scale
-        x2 = padding + (current + s.length - tunnel.start_mileage) * scale
-        bar_w = max(x2 - x1, min_bar)
-        
-        dash = 'stroke-dasharray="3,2"' if s.is_simple_portal else ""
-        stroke = "#7f8c8d" if s.is_simple_portal else "#fff"
-        
-        svg.append(f'<g><rect x="{x1}" y="{y-bar_h/2}" width="{bar_w}" height="{bar_h}" fill="{c}" rx="3" stroke="{stroke}" stroke-width="1.5" {dash}/>')
-        svg.append(f'<text x="{x1+bar_w/2}" y="{y}" text-anchor="middle" class="lbl">{s.name}</text>')
-        
-        if bar_w >= 60:
-            svg.append(f'<text x="{x1+bar_w/2}" y="{y+12}" text-anchor="middle" class="len">{s.length:.0f}m</text>')
-        
-        if idx == 0:
-            svg.append(f'<text x="{x1}" y="{y+bar_h/2+14}" text-anchor="middle" class="txt">{current:.0f}m</text>')
-        if idx == len(tunnel.sections) - 1:
-            svg.append(f'<text x="{x2}" y="{y+bar_h/2+14}" text-anchor="middle" class="txt">{current+s.length:.0f}m</text>')
-        
-        svg.append('</g>')
-        current += s.length
-    
-    svg.append(f'<line x1="{padding}" y1="{height-8}" x2="{width-padding}" y2="{height-8}" stroke="#bdc3c7" stroke-width="1"/>')
-    svg.append(f'<text x="{padding}" y="{height-12}" text-anchor="middle" class="txt" font-weight="500">{tunnel.start_mileage:.0f}m</text>')
-    svg.append(f'<text x="{width-padding}" y="{height-12}" text-anchor="middle" class="txt" font-weight="500">{tunnel.end_mileage:.0f}m</text>')
-    
-    legend = [("洞口", "#95A5A6"), ("CD法", "#FF6B6B"), ("台阶法", "#4ECDC4")]
-    lx = width - 180
-    for i, (name, color) in enumerate(legend):
-        svg.append(f'<g><rect x="{lx+i*60}" y="35" width="10" height="10" fill="{color}" rx="2"/><text x="{lx+i*60+14}" y="44" font-size="9" fill="#666">{name}</text></g>')
-    
-    svg.append('</svg>')
-    return '\n'.join(svg)
-
-# ==================== 会话状态 ====================
-def init_state():
-    if 'project' not in st.session_state:
-        st.session_state.project = create_default_project()
-    if 'selected_tunnel' not in st.session_state:
-        st.session_state.selected_tunnel = "ZK"
-    if 'edited_df' not in st.session_state:
-        project = st.session_state.project
-        tunnel = next((t for t in project.tunnels if t.tunnel_id == st.session_state.selected_tunnel), None)
-        if tunnel:
-            st.session_state.edited_df = pd.DataFrame(tunnel.get_paragraphs_with_positions())
-        else:
-            st.session_state.edited_df = pd.DataFrame()
-
-def get_tunnel() -> Optional[Tunnel]:
-    return next((t for t in st.session_state.project.tunnels if t.tunnel_id == st.session_state.selected_tunnel), None)
-
-def update_edited_df(tunnel: Tunnel):
-    if tunnel:
-        st.session_state.edited_df = pd.DataFrame(tunnel.get_paragraphs_with_positions())
-
-# ==================== 主界面 ====================
-def main():
-    init_state()
-    tunnel = get_tunnel()
-    
-    with st.sidebar:
-        st.title("🚇 隧道工程")
-        st.markdown("---")
-        st.info("**泸州龙透关隧道工程**")
-        
-        # 标准选择器
-        st.markdown("### 📋 验收标准")
-        
-        # 标准选项
-        standard_options = {
-            "TB10753-2018": ("TB10753-2018", "铁路隧道-高铁"),
-            "TB10417": ("TB10417", "铁路隧道-普通"),
-            "JTG F80": ("JTG F80", "公路隧道"),
-            "CJJ 37": ("CJJ 37", "市政隧道"),
-            "GB 50299": ("GB 50299", "地铁隧道")
-        }
-        
-        # 当前选中
-        current_std_name = get_current_standard().value
-        options_list = list(standard_options.keys())
-        current_idx = options_list.index(current_std_name) if current_std_name in options_list else 0
-        
-        selected_std_name = st.selectbox(
-            "选择验收标准",
-            options=options_list,
-            index=current_idx,
-            help="切换不同的验收标准会影响检验批划分规则"
+        # 3. 透视表 (分部 vs 分项)
+        st.markdown("**分部-分项 数量交叉统计表**")
+        pivot_table = pd.pivot_table(
+            df_stats, 
+            index='分部', 
+            columns='分项', 
+            values='编号', 
+            aggfunc='count', 
+            fill_value=0
         )
+        st.dataframe(pivot_table, width='stretch')
         
-        # 更新标准
-        new_standard = None
-        for std in InspectionStandard:
-            if std.value == selected_std_name:
-                new_standard = std
-                break
-        
-        if new_standard and new_standard != get_current_standard():
-            st.session_state.current_standard = new_standard
-            st.success(f"已切换至: {STANDARD_INFO[new_standard]['full_name']}")
-            st.rerun()
-        
-        # 显示当前标准信息
-        current_std = get_current_standard()
-        std_info = STANDARD_INFO[current_std]
-        st.caption(f"📌 {std_info['industry']}")
-        
-        st.markdown("---")
-        
-        st.markdown("### 🛤 隧道")
-        names = ["左线", "右线", "A匝道", "B匝道"]
-        ids = ["ZK", "YK", "AK", "BK"]
-        
-        idx = ids.index(st.session_state.selected_tunnel) if st.session_state.selected_tunnel in ids else 0
-        name = st.selectbox("选择", names, index=idx)
-        new_id = ids[names.index(name)]
-        
-        if new_id != st.session_state.selected_tunnel:
-            st.session_state.selected_tunnel = new_id
-            update_edited_df(get_tunnel())
-            st.rerun()
-        
-        if st.button("🔄 重置配置", type="secondary"):
-            st.session_state.project = create_default_project()
-            update_edited_df(get_tunnel())
-            st.rerun()
-        
-        if tunnel:
-            st.markdown("---")
-            st.markdown("### 📐 隧道参数")
-            
-            c1, c2 =st.columns(2)
-            with c1:
-                new_start = st.number_input("起点(m)", value=float(tunnel.start_mileage), step=1.0)
-            with c2:
-                min_end = new_start + 10
-                new_end = st.number_input("终点(m)", value=float(tunnel.end_mileage), min_value=min_end, step=1.0)
-            
-            if new_start != tunnel.start_mileage or new_end != tunnel.end_mileage:
-                tunnel.start_mileage = new_start
-                tunnel.end_mileage = new_end
-                tunnel.recalculate_positions()
-                update_edited_df(tunnel)
-                st.rerun()
-            
-            # 开挖方向选择
-            c_dir, c_len = st.columns(2)
-            with c_dir:
-                direction = st.selectbox(
-                    "开挖方向", 
-                    ["正向", "反向"],
-                    index=0 if tunnel.excavation_direction == "正向" else 1,
-                    help="正向=里程递增，反向=里程递减"
-                )
-                if direction != tunnel.excavation_direction:
-                    tunnel.excavation_direction = direction
-                    tunnel.recalculate_positions()
-                    update_edited_df(tunnel)
-                    st.rerun()
-            
-            with c_len:
-                st.write(f"**总长: {tunnel.total_length:.1f}m**")
-            
-            stats = {
-                "段落数": len(tunnel.sections),
-                "检验批": sum(len(generate_inspection_batches(tunnel, s, tunnel.start_mileage + sum(x.length for x in tunnel.sections[:i]))) 
-                            for i, s in enumerate(tunnel.sections) if not s.is_simple_portal)
-            }
-            
-            st.markdown("---")
-            st.markdown("### 📊 统计")
-            st.write(f"- 段落: {stats['段落数']}")
-            st.write(f"- 检验批: {stats['检验批']}")
-        
-        # 当前标准信息
-        current_std = get_current_standard()
-        std_info = STANDARD_INFO[current_std]
-        
-        with st.expander(f"📖 {std_info['name']} 分部分项"):
-            st.markdown(f"**{std_info['full_name']}**")
-            st.markdown(f"*{std_info['description']}*")
-            st.markdown("---")
-            
-            # 显示当前标准的分部工程
-            st.markdown("**分部工程：**")
-            subproject_codes = get_subproject_codes()
-            for name, code in subproject_codes.items():
-                st.markdown(f"- {code} {name}")
-            
-            # 显示当前标准的循环进尺
-            st.markdown("---")
-            st.markdown("**循环进尺(m/循环)：**")
-            advance_table = get_advance_per_cycle()
-            for method, advance in advance_table.items():
-                st.markdown(f"- {method}: {advance}m")
-    
-    st.title("🚇 泸州龙透关隧道检验批划分系统")
-    
-    # 动态显示当前标准
-    current_std = get_current_standard()
-    std_info = STANDARD_INFO[current_std]
-    st.markdown(f"**{std_info['name']} 标准 · {std_info['industry']} · 检验批自动生成**")
-    
-    if not tunnel:
-        st.error("未找到隧道")
-        return
-    
-    # 纵断面图
-    st.subheader(f"📐 {tunnel.name} 纵断面图")
-    
-    with st.container():
-        st.markdown(f'<div style="border:1px solid #e9ecef;border-radius:5px;padding:10px 0;overflow-x:auto">{generate_svg(tunnel)}</div>', unsafe_allow_html=True)
-    
-    # 段落列表
-    st.markdown("---")
-    st.subheader("📝 段落列表 (点击直接编辑)")
-    
-    if tunnel.sections:
-        # 段落列表
-        config = {
-            "序号": st.column_config.NumberColumn("№", width="small", disabled=True),
-            "ID": st.column_config.TextColumn("ID", width="small", disabled=True),
-            "名称": st.column_config.TextColumn("名称", width="medium"),
-            "起点桩号": st.column_config.TextColumn("起点里程*", width="small", disabled=False, help="Kxxx+xxx格式，修改后自动更新所有里程"),
-            "终点桩号": st.column_config.TextColumn("终点桩号", width="small", disabled=True),
-            "长度(m)": st.column_config.NumberColumn("长度(m)", width="small", min_value=2.0),
-            "开挖方法": st.column_config.SelectboxColumn("开挖方法*", width="small", 
-                options=[m.value for m in ExcavationMethod], required=True),
-            "循环进尺(m)": st.column_config.NumberColumn("循环进尺*", width="small", disabled=True),
-            "步骤数": st.column_config.TextColumn("步骤数", width="small", disabled=True),
-            "围岩等级": st.column_config.SelectboxColumn("围岩", width="small", 
-                options=[g.value for g in RockGrade]),
-            "检验批": st.column_config.TextColumn("检验批", width="small", disabled=True)
-        }
-        
-        edited_df = st.data_editor(
-            st.session_state.edited_df,
-            column_config=config,
-            width='stretch',
-            num_rows="dynamic",
-            key="editor"
-        )
-        
-        # 检测起点里程是否被修改
-        if not edited_df.empty and len(st.session_state.edited_df) > 0:
-            old_start = st.session_state.edited_df.iloc[0]["起点桩号"]
-            new_start = edited_df.iloc[0]["起点桩号"]
-            
-            # 如果起点里程被修改
-            if new_start != old_start and new_start.startswith("K"):
-                try:
-                    # 解析新起点里程（格式 Kxxx+xxx）
-                    parts = new_start.replace("K", "").split("+")
-                    new_start_m = float(parts[0]) * 1000 + float(parts[1])
-                    
-                    # 计算差值
-                    diff = new_start_m - tunnel.start_mileage
-                    
-                    # 更新隧道起点
-                    tunnel.start_mileage = new_start_m
-                    
-                    # 重新计算所有段落里程
-                    tunnel.recalculate_positions()
-                    
-                    # 重新生成表格
-                    update_edited_df(tunnel)
-                    edited_df = st.session_state.edited_df.copy()
-                    
-                    st.success(f"✅ 起点里程已更新: {new_start}，所有段落里程自动同步")
-                except Exception as e:
-                    st.error(f"❌ 里程格式错误，请使用 Kxxx+xxx 格式")
-        
-        # 继续处理其他字段变更
-        if not edited_df.equals(st.session_state.edited_df):
-            for i in edited_df.index:
-                edited_df.at[i, "ID"] = f"{tunnel.tunnel_id}-S{i+1:02d}"
-                
-                method = edited_df.at[i, "开挖方法"]
-                if method in ["CD法", "CRD法"]:
-                    edited_df.at[i, "循环进尺(m)"] = 0.8
-                    edited_df.at[i, "步骤数"] = "4步(左上下/右上下)"
-                elif method == "双隔壁法":
-                    edited_df.at[i, "循环进尺(m)"] = 0.8
-                    edited_df.at[i, "步骤数"] = "6步(左上下/右上下/中上下)"
-                elif method == "双隔壁法(8步)":
-                    edited_df.at[i, "循环进尺(m)"] = 0.8
-                    edited_df.at[i, "步骤数"] = "8步(左中下/右中下/正中下)"
-                elif method == "洞口":
-                    edited_df.at[i, "循环进尺(m)"] = 0.0
-                    edited_df.at[i, "步骤数"] = "3步(开挖/支护/衬砌)"
-                elif method == "全断面法":
-                    edited_df.at[i, "循环进尺(m)"] = 1.6
-                    edited_df.at[i, "步骤数"] = "1步(全断面)"
-                else:  # 台阶法、环形开挖法等
-                    edited_df.at[i, "循环进尺(m)"] = 1.6
-                    if method == "台阶法":
-                        edited_df.at[i, "步骤数"] = "2步(上台阶/下台阶)"
-                    else:
-                        edited_df.at[i, "步骤数"] = "4步"
-                
-                edited_df.at[i, "检验批"] = "❌" if method == "洞口" else "✅"
-            
-            tunnel.apply_changes(edited_df)
-            st.session_state.edited_df = edited_df.copy()
-            st.rerun()
-        
-        ok, issues = tunnel.validate()
-        if ok:
-            st.success("✅ 段落连续")
-        else:
-            st.warning("⚠️ " + " | ".join(issues))
-        
-        c_auto, c_reset = st.columns(2)
-        
-        with c_auto:
-            if st.button("🔧 自动排版", help="整理所有段落位置"):
-                tunnel.recalculate_positions()
-                update_edited_df(tunnel)
-                st.rerun()
-        
-        with c_reset:
-            if st.button("🔄 取消"):
-                update_edited_df(tunnel)
-                st.rerun()
-    
-    # 检验批生成
-    st.markdown("---")
-    st.subheader("📋 检验批清单 (TB10753-2018)")
-    
-    c1, c2, c3 = st.columns([1, 1, 1])
-    
-    with c1:
-        opts = ["全部(不含洞口)"]
-        for s in tunnel.sections:
-            if not s.is_simple_portal:
-                opts.append(f"{s.section_id}: {s.name}")
-        sel = st.selectbox("选择段落", opts)
-    
-    with c2:
-        gen_btn = st.button("📄 生成检验批", type="primary")
-    
-    with c3:
-        fmt = st.selectbox("导出格式", ["CSV", "Excel", "JSON"])
-    
-    if gen_btn:
-        with st.spinner("生成中..."):
-            all_batches = []
-            paragraphs = tunnel.get_paragraphs_with_positions()
-            
-            if "全部" in sel:
-                for i, s in enumerate(tunnel.sections):
-                    if not s.is_simple_portal:
-                        # 解析起点桩号获取数值
-                        start_str = paragraphs[i]["起点桩号"]
-                        parts = start_str.replace("K", "").split("+")
-                        start_m = float(parts[0]) * 1000 + float(parts[1])
-                        all_batches.extend(generate_inspection_batches(tunnel, s, start_m))
-            else:
-                for i, s in enumerate(tunnel.sections):
-                    if not s.is_simple_portal and f"{s.section_id}:" in sel:
-                        # 解析起点桩号获取数值
-                        start_str = paragraphs[i]["起点桩号"]
-                        parts = start_str.replace("K", "").split("+")
-                        start_m = float(parts[0]) * 1000 + float(parts[1])
-                        all_batches.extend(generate_inspection_batches(tunnel, s, start_m))
-                        break
-            
-            if all_batches:
-                df = pd.DataFrame(all_batches)
-                st.success(f"✅ 成功生成 **{len(df)}** 条检验批")
-                
-                # 统计
-                c = st.columns(4)
-                c[0].metric("分部数", df["分部工程"].nunique())
-                c[1].metric("分项数", df["分项工程"].nunique())
-                c[2].metric("里程段", df["里程范围"].nunique())
-                c[3].metric("循环", df["循环号"].max())
-                
-                # 分部工程统计
-                st.markdown("#### 分部工程统计")
-                subproject_stats = df.groupby("分部工程").size()
-                st.dataframe(subproject_stats.to_frame("检验批数"), width=300)
-                
-                # 数据预览
-                st.dataframe(df, width='stretch', height=250)
-                
-                # 导出
-                if fmt == "CSV":
-                    csv = df.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button("下载CSV", csv, f"{tunnel.tunnel_id}_检验批.csv", "text/csv")
-                elif fmt == "Excel":
-                    from io import BytesIO
-                    b = BytesIO()
-                    with pd.ExcelWriter(b, engine='openpyxl') as w:
-                        df.to_excel(w, index=False)
-                    st.download_button("下载Excel", b.getvalue(), f"{tunnel.tunnel_id}_检验批.xlsx", "application/vnd.openxmlformats")
-                else:
-                    st.download_button("下载JSON", json.dumps(all_batches, ensure_ascii=False, indent=2), f"{tunnel.tunnel_id}_检验批.json", "application/json")
-            else:
-                st.warning("无有效段落")
-    
-    with st.expander("ℹ️ 操作说明"):
-        st.markdown("""
-        **操作说明：**
-        
-        ✅ 点击单元格直接编辑段落参数
-        
-        ✅ 循环进尺自动设置：
-        - 洞口: 0.0
-        - CD法/CRD法/双隔壁法: 0.8m
-        - 台阶法/环形开挖法: 1.6m
-        
-        ✅ 检验批生成基于TB10753-2018标准
-        """)
-
-if __name__ == "__main__":
-    main()
+        # 导出汇总
+        out_stats = BytesIO()
+        with pd.ExcelWriter(out_stats) as writer:
+            pivot_table.to_excel(writer, sheet_name="透视汇总")
+            df_stats.to_excel(writer, sheet_name="明细数据", index=False)
+        st.download_button("📥 下载统计报表", out_stats.getvalue(), "统计汇总.xlsx")
