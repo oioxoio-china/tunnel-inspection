@@ -1,0 +1,18 @@
+第一步：安装 Streamlit 和依赖库
+请复制下面的命令，粘贴到 PowerShell 中并回车：
+
+PowerShell
+python -m pip install streamlit pandas matplotlib
+(如果提示 python 找不到，请尝试把开头的 python 换成 py，即：py -m pip install ...)
+
+第二步：运行网页版 APP
+安装完成后，使用下面的命令来启动 APP：
+
+PowerShell
+python -m streamlit run streamlit_app.py
+python -m streamlit run streamlit_app_v2.py
+python -m streamlit run streamlit_app_v3.py
+python -m streamlit run streamlit_app_v4.py
+
+
+(同样，如果 python 没反应，请尝试 py -m streamlit run streamlit_app.py)
